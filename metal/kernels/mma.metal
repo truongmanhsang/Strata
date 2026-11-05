@@ -158,6 +158,27 @@ template <> struct DW<T_Q3_K> {
     }
 };
 
+// Q3_KR (units.metal Dec<T_Q3_KR>'s layout): the same values as DW<T_Q3_K>, bitwise
+template <> struct DW<T_Q3_KR> {
+    static inline void run(device const uchar* row, int u, int k0, thread float* w, thread int& p0, thread int& p1,
+                           threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 114;
+        device const uchar* p = b + 2 + 14 * (u & 7);
+        const ushort4 L = ushort4(*(device const packed_ushort4*)p);
+        const ushort2 H = ushort2(*(device const packed_ushort2*)(p + 8));
+        const char2 S = char2(*(device const packed_char2*)(p + 12));
+        const float d = rdh(b);
+        const float dl1 = d * float(int(S.x)), dl2 = d * float(int(S.y));
+        for (int l = 0; l < 32; ++l) {
+            const int w2 = l >> 1, hi8 = (l & 1) ? 8 : 0;
+            const int code = int((L[w2 & 3] >> (hi8 + 2 * (w2 >> 2))) & 3) | (int((H[w2 & 1] >> (hi8 + (w2 >> 1))) & 1) << 2);
+            w[l] = (l < 16 ? dl1 : dl2) * float(code - 4);
+        }
+        p0 = 32 * u - k0;
+        p1 = p0 + 16;
+    }
+};
+
 struct MmaArgs {
     uint n_in;
     uint n_out;

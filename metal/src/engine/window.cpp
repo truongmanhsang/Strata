@@ -17,6 +17,7 @@
 #include "ref_quant.h"
 #include "arena_budget.h"
 #include "stream.h"
+#include "q3kr.h"
 #include "../../tests/coop_probe.h"
 
 #include "strata/core/weights.hpp"
@@ -42,6 +43,7 @@ namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include <signal.h>
 #include <unistd.h>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <sys/mman.h>
@@ -546,6 +548,17 @@ private:
     bool hc_q8_ = false;
     mtl::Buffer Q8_;
     std::map<std::string, size_t> q8off_;
+    // STRATA_METAL_Q3KR=1 (streaming): the W_ offsets of the dense Q3_K matrices that load_dense re-laid as Q3_KR (q3kr.h);
+    // the decode GEMVs (gemv) and the prompt's dequant (dq_f16) read them as type 111, everything else is unchanged
+    std::set<uint64_t> q3r_;
+    bool q3r(const gguf::Tensor& t, const mtl::Buffer* buf = nullptr) const {
+        return t.type == ref::Q3_K && !q3r_.empty() && (buf == nullptr || buf == &W_) && q3r_.count(t.offset) > 0;
+    }
+    int wtype(const gguf::Tensor& t) const { return q3r(t) ? 111 : t.type; }   // the kernels' type of a W_ matrix
+    uint32_t wrow_bytes(const gguf::Tensor& t) const {
+        const int n_in = (int) t.shape[0];
+        return q3r(t) ? (uint32_t) ((size_t) n_in / 256 * strata_metal::kQ3KRBlock) : (uint32_t) ref::row_bytes(t.type, n_in);
+    }
     // MTP
     bool mtp_on_ = false;
     int lmtp_ = -1;
@@ -844,7 +857,18 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         std::vector<std::string> skip;   // the BF16 originals of the Q8_0 HC copies are not read again
         if (hc_q8_)
             for (const auto& kv : q8off_) skip.push_back(kv.first);
-        if (!st_->load_dense(f_, *cx_, skip, W_, err)) return false;
+        // STRATA_METAL_Q3KR=1 (opt-in): the dense Q3_K matrices read in as Q3_KR (not the token embedding: its rows are read
+        // by index).  M2 Max (gemv_parity GEMV_Q3KR=1): the decode GEMVs 1.4-1.8x faster, the output bitwise Q3_K's.
+        const bool q3kr_on = std::getenv("STRATA_METAL_Q3KR") && std::string(std::getenv("STRATA_METAL_Q3KR")) == "1";
+        std::function<bool(const gguf::Tensor&)> relay;
+        if (q3kr_on)
+            relay = [](const gguf::Tensor& t) {
+                return t.type == ref::Q3_K && t.shape.size() >= 2 && t.shape[0] % 256 == 0 && t.name.find("token_embd") == std::string::npos;
+            };
+        std::vector<uint64_t> relaid;
+        if (!st_->load_dense(f_, *cx_, skip, W_, err, relay, &relaid)) return false;
+        q3r_.insert(relaid.begin(), relaid.end());
+        if (q3kr_on) std::fprintf(stderr, "strata metal: STRATA_METAL_Q3KR=1: %zu dense Q3_K matrices read in as Q3_KR\n", relaid.size());
         const char* e = std::getenv("STRATA_METAL_PREFETCH");
         st_pred_ = !(e && std::atoi(e) <= 0);
         if (st_pred_) predL_ = A(4 * (size_t) 48 * MAXT * 512);
@@ -916,13 +940,17 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
             if (K == 1 || (L == 32 && K == 2)) Rr = 2;
         }
     }
+    // STRATA_METAL_Q3KR=1: a Q3_K matrix of W_ that load_dense re-laid as Q3_KR (the same x planes; one token: 16,2 or, fp16 below
+    // 10240 rows, 16,1 - gemv_parity GEMV_Q3KR=1 on an M2 Max)
+    const bool kr = !wb && q3r(t);
     const int k16 = f16_enc_ && x.n == n_in ? x16_kind(ty) : -1;
+    if (kr && ntok == 1 && K == 1 && S == 4 && n_out >= 6144) { L = 16; Rr = k16 >= 0 && n_out < 10240 ? 1 : 2; }
     const bool f16 = k16 >= 0 && gemv16_tile(L, Rr, S, K);
-    const std::string fn = std::string(f16 ? "gemv16_" : "gemv_") + std::to_string(ty) + "_" + std::to_string(L) + "_" +
+    const std::string fn = std::string(f16 ? "gemv16_" : "gemv_") + std::to_string(kr ? 111 : ty) + "_" + std::to_string(L) + "_" +
                            std::to_string(Rr) + "_" + std::to_string(S) + "_" + std::to_string(K);
     const mtl::Pipeline* p = P(lib_, fn, mtl::Constants().i(0, ntok), fn + "#" + std::to_string(ntok));
-    GemvArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ntok, (uint32_t) ref::row_bytes(t.type, n_in), (uint32_t) n_in,
-               (uint32_t) y_stride};
+    const uint32_t rbytes = kr ? (uint32_t) ((size_t) n_in / 256 * strata_metal::kQ3KRBlock) : (uint32_t) ref::row_bytes(t.type, n_in);
+    GemvArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ntok, rbytes, (uint32_t) n_in, (uint32_t) y_stride};
     mtl::Dispatch d;
     d.p = p;
     d.args = {mtl::Arg::B(wb ? *wb : W_, t.offset),
@@ -2889,7 +2917,11 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     auto dq = [&](const gguf::Tensor& t, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
         const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
         if (hc_q8_ && q8off_.count(t.name)) dqb(Q8_, q8off_.at(t.name), ref::Q8_0, n_in, n_out, out, out_off, perm);
-        else dqb(W_, t.offset, t.type, n_in, n_out, out, out_off, perm);
+        else if (q3r(t)) {   // STRATA_METAL_Q3KR: re-laid as Q3_KR
+            PgDq a{(uint32_t) n_in, (uint32_t) n_out, wrow_bytes(t), perm};
+            D(PP(p.lib, "dq_f16_111"), {mtl::Arg::B(W_, t.offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
+              (n_in / pg_unit(t.type) + 63) / 64, n_out, 64);
+        } else dqb(W_, t.offset, t.type, n_in, n_out, out, out_off, perm);
     };
     auto act16 = [&](const mtl::Buffer& x, const mtl::Buffer& xh, size_t n) {
         const uint32_t nn = (uint32_t) n;

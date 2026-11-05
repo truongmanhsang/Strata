@@ -44,6 +44,7 @@ template <> struct XKind<T_Q4_K> { enum { K = XK_P4 }; };
 template <> struct XKind<T_Q5_K> { enum { K = XK_P4 }; };
 template <> struct XKind<T_Q6_K> { enum { K = XK_P2 }; };
 template <> struct XKind<T_Q3_K> { enum { K = XK_P2 }; };
+template <> struct XKind<T_Q3_KR> { enum { K = XK_P2 }; };
 
 // X<F>::load(xp, s16, u, xs, xsum): unit u's prepared x (xp = the token's row of the format's kind, s16 = its sums)
 template <int F> struct X {
@@ -104,6 +105,11 @@ template <> struct X<T_Q3_K> {
         load16(xp + 32 * u + 16, xs + 16);
         xsum[0] = s16[2 * u];
         xsum[1] = s16[2 * u + 1];
+    }
+};
+template <> struct X<T_Q3_KR> {   // Q3_K's
+    template <typename P> static inline void load(P xp, P s16, int u, thread float* xs, thread float* xsum) {
+        X<T_Q3_K>::load(xp, s16, u, xs, xsum);
     }
 };
 
@@ -283,6 +289,25 @@ template <> struct Dec<T_Q3_K> {
     }
 };
 
+// Q3_KR (q3kr.h): a block = d (half) + 8 units of 14 bytes: L[4] (ushort; word w = 4a + b: bits 2a and 8 + 2a of L[b]
+// are the low 2 bits of values 2w and 2w + 1), H[2] (ushort; word w = 2a + b: bits a and 8 + a of H[b] are their high
+// bits), then the unit's two scales as int8 (the 6-bit Q3_K scale - 32).  The values, scales and their order are
+// Q3_K's: the same products and sums, so the output is bitwise Q3_K's.
+template <> struct Dec<T_Q3_KR> {
+    static inline void run(device const uchar* row, int u, thread float* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 114;
+        device const uchar* p = b + 2 + 14 * (u & 7);
+        const ushort4 L = ushort4(*(device const packed_ushort4*)p);
+        const ushort2 H = ushort2(*(device const packed_ushort2*)(p + 8));
+        const char2 S = char2(*(device const packed_char2*)(p + 12));
+        const float d = rdh(b);
+        for (int w = 0; w < 16; ++w)
+            bytes2(((L[w & 3] >> (2 * (w >> 2))) & 0x0303) | (((H[w & 1] >> (w >> 1)) & 0x0101) << 2), q + 2 * w);
+        const float d1 = d * float(int(S.x)), d2 = d * float(int(S.y));
+        sc = float4(d1, d2, 4.0f * d1, 4.0f * d2);
+    }
+};
+
 template <> struct Dec<T_F32> {   // 16 floats a unit (the Unsloth files' router / alpha / beta / inject rows)
     static inline void run(device const uchar* row, int u, thread float* q, thread float4& sc, threadgroup const uint*) {
         device const float4* p = (device const float4*)(row + 64 * u);
@@ -357,6 +382,20 @@ template <> struct Dec16<T_Q3_K> {
         sc = float4(d1, d2, 4.0f * d1, 4.0f * d2);
     }
 };
+template <> struct Dec16<T_Q3_KR> {   // (Dec<T_Q3_KR>'s layout)
+    static inline void run(device const uchar* row, int u, thread half* q, thread float4& sc, threadgroup const uint*) {
+        device const uchar* b = row + (u >> 3) * 114;
+        device const uchar* p = b + 2 + 14 * (u & 7);
+        const ushort4 L = ushort4(*(device const packed_ushort4*)p);
+        const ushort2 H = ushort2(*(device const packed_ushort2*)(p + 8));
+        const char2 S = char2(*(device const packed_char2*)(p + 12));
+        const float d = rdh(b);
+        for (int w = 0; w < 16; ++w)
+            bytes2h(((L[w & 3] >> (2 * (w >> 2))) & 0x0303) | (((H[w & 1] >> (w >> 1)) & 0x0101) << 2), q + 2 * w);
+        const float d1 = d * float(int(S.x)), d2 = d * float(int(S.y));
+        sc = float4(d1, d2, 4.0f * d1, 4.0f * d2);
+    }
+};
 // Q3_K's prepared x (32 contiguous of the 2^-8 plane, sums per 16 in float) from the half plane
 template <int F> struct X16;
 template <> struct X16<T_Q3_K> {
@@ -368,6 +407,11 @@ template <> struct X16<T_Q3_K> {
         }
         xsum[0] = s16[2 * u];
         xsum[1] = s16[2 * u + 1];
+    }
+};
+template <> struct X16<T_Q3_KR> {   // Q3_K's
+    static inline void load(device const half* xp, device const float* s16, int u, thread half* xs, thread float* xsum) {
+        X16<T_Q3_K>::load(xp, s16, u, xs, xsum);
     }
 };
 template <int UNIT>

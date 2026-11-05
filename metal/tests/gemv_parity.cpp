@@ -5,9 +5,12 @@
 //   gemv_parity --bench [--pack Q2_0|IQ3_XXS] [--ntok N] [--all]   speed on the pack's shapes (best tile per shape)
 //   gemv_parity --one TYPE NIN NOUT [--ntok N]                      sweep one shape
 //   GEMV_F16=1 gemv_parity --one TYPE NIN NOUT [--ntok N]           the fp16 tiles (STRATA_METAL_F16) against the fp32 gemv
+//   GEMV_Q3KR=1 gemv_parity --one Q3_K NIN NOUT [--ntok N]          each tile also over the Q3_KR re-layout (q3kr.h): bitwise
+//                                                                   equal outputs and the time (with GEMV_F16=1: the fp16 tiles)
 #include "gguf_lite.h"
 #include "mtl_rt.h"
 #include "ref_quant.h"
+#include "q3kr.h"
 
 #include <algorithm>
 #include <cmath>
@@ -281,6 +284,16 @@ int main(int argc, char** argv) {
             ref::random_blocks(s.type, tmp.data(), s.n_out, s.n_in, 99);
             for (int c = 0; c < copies; ++c) std::memcpy(W.as<uint8_t>() + (size_t)c * mb, tmp.data(), mb);
         }
+        // GEMV_Q3KR=1: the same rows re-laid as Q3_KR (114-byte blocks)
+        const bool q3kr = std::getenv("GEMV_Q3KR") && s.type == ref::Q3_K;
+        const size_t rb2 = (size_t)s.n_in / 256 * strata_metal::kQ3KRBlock, mb2 = rb2 * s.n_out;
+        mtl::Buffer W2, y2;
+        if (q3kr) {
+            W2 = cx.alloc(mb2 * copies);
+            y2 = cx.alloc(4 * (size_t)s.n_out * MAXT);
+            for (int c = 0; c < copies; ++c)
+                strata_metal::q3kr_repack(W.as<uint8_t>() + (size_t)c * mb, W2.as<uint8_t>() + (size_t)c * mb2, s.n_out, s.n_in);
+        }
         ref::Rng r(5);
         for (int i = 0; i < s.n_in * MAXT; ++i) x.as<float>()[i] = r.sym();
         mtl::Buffer xp = cx.alloc(4 * (4 * s.n_in * MAXT + s.n_in / 16 * MAXT));
@@ -344,6 +357,29 @@ int main(int argc, char** argv) {
                 std::vector<double> t;
                 for (int i = 0; i < 5; ++i) t.push_back(cx.run(ds) / R);
                 const double m = median(t);
+                if (q3kr) {   // the same tile over Q3_KR: its time and whether every output float equals Q3_K's
+                    const std::string kr = (f16 ? std::string("gemv16") : std::string("gemv")) + "_111_" + std::to_string(c.L) + "_" +
+                                           std::to_string(c.R) + "_" + std::to_string(c.S) + "_" + std::to_string(c.K);
+                    mtl::Pipeline p2 = cx.pipeline(lib, kr, mtl::Constants().i(0, nt).i(9, 0));
+                    GemvArgs a2{(uint32_t)s.n_in, (uint32_t)s.n_out, (uint32_t)nt, (uint32_t)rb2, (uint32_t)s.n_in, (uint32_t)s.n_out};
+                    std::vector<mtl::Dispatch> d2 = ds;
+                    for (int k = 0; k < (int)d2.size(); ++k) {
+                        d2[k].p = &p2;
+                        d2[k].args[0] = mtl::Arg::B(W2, (size_t)(k % copies) * mb2);
+                        d2[k].args[3] = mtl::Arg::B(y2);
+                        d2[k].args[4] = mtl::Arg::V(a2);
+                    }
+                    cx.warm(d2, 0.05);
+                    std::vector<double> t2;
+                    for (int i = 0; i < 5; ++i) t2.push_back(cx.run(d2) / R);
+                    const double m2 = median(t2);
+                    cx.run({ds[0]});
+                    cx.run({d2[0]});
+                    const bool same = std::memcmp(y.as<float>(), y2.as<float>(), 4 * (size_t)s.n_out * nt) == 0;
+                    std::printf("   tile %2d,%d,%d,%d: Q3_K %8.2f us | Q3_KR %8.2f us (%.2fx, %6.1f GB/s of Q3_K bytes) %s\n", c.L, c.R, c.S, c.K,
+                                m * 1e6, m2 * 1e6, m / m2, mb / m2 / 1e9, same ? "bitwise equal" : "DIFFERENT");
+                    if (!same) worst16 = 1.0;   // a failure
+                }
                 double rel = 0;
                 if (f16) {   // ds[0] reads copy 0: its output against the fp32 reference
                     cx.run({ds[0]});
@@ -369,6 +405,7 @@ int main(int argc, char** argv) {
         cx.free(xp);
         cx.free(xh);
         cx.free(yr);
+        if (q3kr) { cx.free(W2); cx.free(y2); }
     }
     if (worst16 >= 0) {   // GEMV_F16: half products of 8, float scales - ~1e-3 of the fp32 output
         std::printf("fp16: worst rel L2 vs fp32 %.2e  %s\n", worst16, worst16 < 4e-3 ? "PASS" : "FAIL");

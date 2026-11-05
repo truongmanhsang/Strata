@@ -27,6 +27,7 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 
 #define T_Q4_0 2
 #define T_Q3_K 11
+#define T_Q3_KR 111   // Q3_K re-laid at load (q3kr.h): each 32-value unit's bits together, int8 scales
 #define T_BF16 30
 #define T_F32 0
 #define T_Q5_0 6
@@ -64,6 +65,7 @@ template <> struct fmt<T_IQ3_S>   { enum { QK = 256, BB = 110, UNIT = 16, TAB = 
 template <> struct fmt<T_IQ4_NL>  { enum { QK = 32,  BB = 18,  UNIT = 32, TAB = 256 }; };
 template <> struct fmt<T_IQ4_XS>  { enum { QK = 256, BB = 136, UNIT = 32, TAB = 256 }; };
 template <> struct fmt<T_Q3_K>    { enum { QK = 256, BB = 110, UNIT = 32, TAB = 1 }; };
+template <> struct fmt<T_Q3_KR>   { enum { QK = 256, BB = 114, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q4_K>    { enum { QK = 256, BB = 144, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q5_K>    { enum { QK = 256, BB = 176, UNIT = 32, TAB = 1 }; };
 template <> struct fmt<T_Q6_K>    { enum { QK = 256, BB = 210, UNIT = 32, TAB = 1 }; };
@@ -378,6 +380,7 @@ template <> inline void load_tab<T_Q4_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_1>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q3_K>(threadgroup uint*, ushort, ushort) {}
+template <> inline void load_tab<T_Q3_KR>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q4_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q5_K>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q6_K>(threadgroup uint*, ushort, ushort) {}

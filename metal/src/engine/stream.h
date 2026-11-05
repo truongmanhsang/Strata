@@ -43,7 +43,8 @@ public:
     // The dense tensors into one buffer; every tensor's offset in `f` is rewritten to its offset in `out`.
     // Tensors named in `skip` are left out (their offset is set to 0: they must not be read any more).
     bool load_dense(gguf::File& f, mtl::Context& cx, const std::vector<std::string>& skip, mtl::Buffer& out,
-                    std::string& err);
+                    std::string& err,
+                    const std::function<bool(const gguf::Tensor&)>& q3kr = {}, std::vector<uint64_t>* q3kr_offsets = nullptr);
     // The arena: `budget` bytes of slots, filled from the profile's ranking (or layer-interleaved if none).
     // min_slots: each size class at least this many slots (576 with prompt chunks, else 64)
     // recheck (optional): just before the arena is committed, the bytes it may have now (arena_shrink); when that is

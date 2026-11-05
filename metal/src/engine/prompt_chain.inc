@@ -171,8 +171,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     };
     auto dq = [&](const gguf::Tensor& t, const mtl::Buffer& out, size_t out_off = 0, uint32_t perm = 0) {
         const int n_in = (int) t.shape[0], n_out = t.shape.size() > 1 ? (int) t.shape[1] : 1;
-        PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, (uint32_t) ref::row_bytes(t.type, n_in), perm};
-        D(P_(b.lib, "dq_f16_" + std::to_string(t.type)), {mtl::Arg::B(W_, t.offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
+        PcDqArgs a{(uint32_t) n_in, (uint32_t) n_out, wrow_bytes(t), perm};   // (a Q3_KR matrix: type 111, STRATA_METAL_Q3KR)
+        D(P_(b.lib, "dq_f16_" + std::to_string(wtype(t))), {mtl::Arg::B(W_, t.offset), mtl::Arg::B(out, out_off), mtl::Arg::V(a)},
           (n_in / pc_unit_of(t.type) + 63) / 64, n_out, 64);
     };
     auto act16 = [&](const mtl::Buffer& x, const mtl::Buffer& xh, size_t n) {

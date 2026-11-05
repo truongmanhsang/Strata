@@ -3,6 +3,7 @@
 
 #include "ref_quant.h"
 #include "arena_budget.h"
+#include "q3kr.h"
 
 #include <sys/sysctl.h>
 
@@ -189,8 +190,16 @@ bool ExpertStream::read(void* dst, uint64_t len, uint64_t off) const {
     return true;
 }
 
+namespace {
+// a dense tensor's bytes in the weight buffer: a Q3_K matrix re-laid as Q3_KR (q3kr.h) takes 114 of every 110
+uint64_t dense_bytes(const gguf::Tensor& t, const std::function<bool(const gguf::Tensor&)>& q3kr) {
+    return q3kr && q3kr(t) ? t.bytes / strata_metal::kQ3KBlock * strata_metal::kQ3KRBlock : t.bytes;
+}
+}  // namespace
+
 bool ExpertStream::load_dense(gguf::File& f, mtl::Context& cx, const std::vector<std::string>& skip, mtl::Buffer& out,
-                              std::string& err) {
+                              std::string& err, const std::function<bool(const gguf::Tensor&)>& q3kr,
+                              std::vector<uint64_t>* q3kr_offsets) {
     const double t0 = now_ms();
     std::vector<gguf::Tensor*> ts;
     uint64_t tot = 0;
@@ -202,7 +211,7 @@ bool ExpertStream::load_dense(gguf::File& f, mtl::Context& cx, const std::vector
         if (t.name == "per_layer_token_embd.weight") continue;
         if (std::find(skip.begin(), skip.end(), t.name) != skip.end()) { t.offset = 0; continue; }
         ts.push_back(&t);
-        tot += (t.bytes + 255) / 256 * 256;
+        tot += (dense_bytes(t, q3kr) + 255) / 256 * 256;
     }
     out = cx.alloc((tot + PAGE - 1) / PAGE * PAGE);
     std::vector<uint64_t> src(ts.size()), dst(ts.size());
@@ -210,7 +219,7 @@ bool ExpertStream::load_dense(gguf::File& f, mtl::Context& cx, const std::vector
     for (size_t i = 0; i < ts.size(); ++i) {
         src[i] = ts[i]->offset;
         dst[i] = o;
-        o += (ts[i]->bytes + 255) / 256 * 256;
+        o += (dense_bytes(*ts[i], q3kr) + 255) / 256 * 256;
     }
     std::atomic<size_t> next{0};
     std::atomic<bool> ok{true};
@@ -220,12 +229,20 @@ bool ExpertStream::load_dense(gguf::File& f, mtl::Context& cx, const std::vector
             for (;;) {
                 const size_t i = next++;
                 if (i >= ts.size()) break;
-                if (!read(out.as<uint8_t>() + dst[i], ts[i]->bytes, src[i])) ok = false;
+                if (q3kr && q3kr(*ts[i])) {   // read, then re-laid as Q3_KR in its (larger) place
+                    std::vector<uint8_t> tmp(ts[i]->bytes);
+                    if (!read(tmp.data(), ts[i]->bytes, src[i])) { ok = false; continue; }
+                    const size_t n_in = (size_t) ts[i]->shape[0];
+                    strata_metal::q3kr_repack(tmp.data(), out.as<uint8_t>() + dst[i], ts[i]->bytes / (n_in / 256 * strata_metal::kQ3KBlock), n_in);
+                } else if (!read(out.as<uint8_t>() + dst[i], ts[i]->bytes, src[i])) ok = false;
             }
         });
     for (auto& x : th) x.join();
     if (!ok) { err = "metal stream: reading the dense tensors failed"; return false; }
-    for (size_t i = 0; i < ts.size(); ++i) ts[i]->offset = dst[i];
+    for (size_t i = 0; i < ts.size(); ++i) {
+        if (q3kr && q3kr_offsets && q3kr(*ts[i])) q3kr_offsets->push_back(dst[i]);
+        ts[i]->offset = dst[i];
+    }
     std::fprintf(stderr, "strata metal stream: %zu dense tensors read into memory (%.2f GB, %.1f s; %zu left out)\n", ts.size(),
                  tot / 1e9, (now_ms() - t0) / 1e3, skip.size());
     return true;
