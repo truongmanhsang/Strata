@@ -62,7 +62,9 @@ public:
     // The host's turn at layer l: ids = the window's T x topk routed ids; pred = T x 512 router logits of layer l + 1
     // computed from this layer's FFN input (nullptr: no read-ahead).
     // pred2: layer l + 2's, from the same input (STRATA_METAL_PREFETCH2 = its top-k, 0 = off)
-    void at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2 = nullptr);
+    // plan: the layer's routing plan (moe.metal P_* layout) in shared memory, for STRATA_METAL_TAIL_SKIP (nullptr: no skip)
+    void at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2 = nullptr,
+                  int32_t* plan = nullptr);
     int ahead2() const { return pre_k2_; }
     // a prompt's scratch buffers inside the arena: region() places them (once), hold_region() empties and holds its
     // slots while a prompt runs and gives them back after
@@ -119,6 +121,9 @@ private:
     int outstanding_ = 0;
     int nio_ = 6, pre_k_ = 10, pre_k2_ = 0, split_ = 2;
     bool prefetch_ = true, fake_ = false, pre_mru_ = false;
+    int tail_rank_ = 0;   // STRATA_METAL_TAIL_SKIP=R (0: off): a decode miss every token routes at rank >= R is not read
+    uint64_t tail_skipped_ = 0;
+    int stats_every_ = 0;   // STRATA_METAL_STREAM_STATS=N: a running-totals line every N decode windows (0: off)
     int ne_ = 512;   // routed experts per layer of this model (512; 256 for the expert-pruned Coder), read from the GGUF at open(); stream.cpp's NE is the largest (array sizes, the 512-wide key / smap stride)
     // stats
     uint64_t stamp_ = 1;   // the handshake count: slots pinned with the current one are in use on the GPU

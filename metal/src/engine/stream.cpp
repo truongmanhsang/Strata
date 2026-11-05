@@ -162,6 +162,15 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
     pre_mru_ = env_int("STRATA_METAL_PREFETCH_MRU", big ? 0 : 1) != 0;
     // timing only (WRONG answers): every missing expert is pointed at slot 0, nothing is read
     fake_ = env_int("STRATA_METAL_STREAM_FAKE", 0) != 0;
+    // STRATA_METAL_TAIL_SKIP=R (opt-in, 1..9; changes the output): in a decode window, an expert that is not in the arena
+    // and that every token routes only at rank >= R (the smallest router weights of the top 10) is not read from the SSD;
+    // its weight is set to zero, without renormalising the others (the CUDA serve's STRATA_ROUTE_TAIL_SKIP rule).
+    stats_every_ = env_int("STRATA_METAL_STREAM_STATS", 0);
+    tail_rank_ = env_int("STRATA_METAL_TAIL_SKIP", 0);
+    if (tail_rank_ < 1 || tail_rank_ > 9) tail_rank_ = 0;
+    if (tail_rank_)
+        std::fprintf(stderr, "strata metal stream: STRATA_METAL_TAIL_SKIP=%d: a decode miss routed only at rank %d or lower "
+                             "is skipped (answers differ slightly)\n", tail_rank_, tail_rank_ + 1);
     return true;
 }
 
@@ -616,20 +625,32 @@ void ExpertStream::ahead(int ln, int T, const float* pred, int K) {
     if (any) cv_.notify_all();
 }
 
-void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2) {
+void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2,
+                            int32_t* plan) {
     const double t0 = now_ms();
     const bool prompt = T > 8;   // a prompt chunk (the GEMM path): nearly every expert of the layer is used
     if (l == 0) { if (prompt) ++p_chunks_; else ++windows_; }
+    if (l == 0 && !prompt && (tail_rank_ || stats_every_ > 0) && windows_ % (uint64_t) (stats_every_ > 0 ? stats_every_ : 1000) == 0) {
+        const double w = (double) windows_;   // STRATA_METAL_TAIL_SKIP (or STRATA_METAL_STREAM_STATS=N): running totals
+        std::fprintf(stderr, "expert stream at %llu windows: misses %.1f, skipped %.1f, waiting %.2f ms per window\n",
+                     (unsigned long long) windows_, misses_ / w, tail_skipped_ / w, wait_ms_ / w);
+    }
     ++stamp_;                    // the slots this layer uses are pinned until the next handshake
     bool used[NE] = {};
     int want[NE];
+    int minr[NE];                // each wanted expert's best (lowest) rank over the window's tokens
     int nw = 0;
     for (int i = 0; i < T * topk; ++i) {
         const int e = ids[i];
-        if (e < 0 || e >= NE || used[e]) continue;
+        if (e < 0 || e >= NE) continue;
+        if (used[e]) { minr[e] = std::min(minr[e], i % topk); continue; }
         used[e] = true;
+        minr[e] = i % topk;
         want[nw++] = e;
     }
+    const bool tail = tail_rank_ > 0 && plan != nullptr && !prompt && !fake_;
+    int skip[NE];
+    int ns = 0;
     if (fake_) {
         for (int j = 0; j < nw; ++j)
             if (where_[(size_t) (l * NE + want[j])] < 0) smap_.as<uint32_t>()[l * NE + want[j]] = code_[0];
@@ -670,6 +691,11 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
                 x.pre = false;
                 continue;
             }
+            if (tail && minr[e] >= tail_rank_) {   // STRATA_METAL_TAIL_SKIP: not read; its weight is zeroed below
+                skip[ns++] = e;
+                ++tail_skipped_;
+                continue;
+            }
             ++(prompt ? p_misses_ : misses_);
             s = victim(lay_[(size_t) l].cls);
             if (s < 0) { std::fprintf(stderr, "strata metal stream: no free slot (layer %d)\n", l); std::exit(6); }
@@ -688,6 +714,38 @@ void ExpertStream::at_layer(int l, int T, int topk, const int32_t* ids, const fl
             return true;
         });
         (prompt ? p_wait_ms_ : wait_ms_) += now_ms() - tw;
+    }
+    if (ns > 0) {
+        // The skipped experts still run in the GPU's expert kernels (the plan is not rebuilt), so they point at a slot
+        // that holds finite weights and is not being written: one of this layer's experts that is in the arena, pinned
+        // and complete now (the rank-0 experts are never skipped, so there is one).  Their entries' weights become 0.
+        uint32_t* sm = smap_.as<uint32_t>();
+        uint32_t donor = 0;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            for (int j = 0; j < nw && !have; ++j) {
+                const int s = where_[(size_t) (l * NE + want[j])];
+                if (s >= 0 && slots_[(size_t) s].state.load() == 0) { donor = sm[l * NE + want[j]]; have = true; }
+            }
+        }
+        if (!have) {   // cannot happen (see above); read them after all rather than compute with a slot in flight
+            std::fprintf(stderr, "strata metal stream: TAIL_SKIP found no complete slot at layer %d\n", l);
+            std::exit(6);
+        }
+        // the plan's layout (moe.metal): P_NG groups, P_GEXP + g its expert, P_GSTART + g .. + g + 1 its entries,
+        // P_EW + entry the entry's weight (a float's bits)
+        constexpr int P_MAXE = 128, P_NG = 0, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
+                      P_EW = P_ETOK + P_MAXE;
+        const int ng = plan[P_NG];
+        for (int q = 0; q < ns; ++q) {
+            const int e = skip[q];
+            sm[l * NE + e] = donor;
+            for (int g = 0; g < ng; ++g) {
+                if (plan[P_GEXP + g] != e) continue;
+                for (int k = plan[P_GSTART + g]; k < plan[P_GSTART + g + 1]; ++k) plan[P_EW + k] = 0;   // +0.0f
+            }
+        }
     }
     if (prompt) {
         // a chunk uses nearly all of the next layer's experts: every one not in the arena is streamed in behind this
@@ -821,6 +879,9 @@ void ExpertStream::report(FILE* f) const {
                  (unsigned long long) late_, misses_ / std::max(1.0, (double) lookups_), misses_ / w,
                  (unsigned long long) pre_issued_, pre_issued_ / w, (unsigned long long) pre_cancel_,
                  (bytes_read_.load() - 0) / 1e6 / w, (unsigned long long) reads_.load(), host_ms_ / w, wait_ms_ / w);
+    if (tail_rank_)
+        std::fprintf(f, "expert stream tail skip  rank >= %d: %llu misses not read (%.1f per window)\n", tail_rank_,
+                     (unsigned long long) tail_skipped_, tail_skipped_ / w);
 }
 
 }  // namespace strata::metal_engine
