@@ -1441,8 +1441,11 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     if (stream_ && !st_->ready() && !stream_arena(err)) return false;
     Cached& cw = wcache_[key];
     rec_ = &cw.qsa;
-    f16_enc_ = metal_f16() && head && !stream_ && !rows_;   // decode windows of one resident sequence: not the prompt's,
-                                                            // not streaming, not batch slots
+    // STRATA_METAL_F16_STREAM=1 (opt-in, with STRATA_METAL_F16=1): the dense GEMVs in fp16 while the experts stream too
+    // (the routed experts stay fp32: m16 reads no arena)
+    static const bool f16_stream = [] { const char* e = std::getenv("STRATA_METAL_F16_STREAM"); return e && std::string(e) == "1"; }();
+    f16_enc_ = metal_f16() && head && (!stream_ || f16_stream) && !rows_;   // decode windows of one resident sequence: not the
+                                                                            // prompt's, not batch slots, streaming only when asked
     cuts_ = stream_ ? &cw.cuts : nullptr;
     std::vector<mtl::Dispatch>& ds = cw.ds;
     nb_ = false;
