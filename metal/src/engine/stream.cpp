@@ -162,6 +162,9 @@ bool ExpertStream::open(const gguf::File& f, std::string& err) {
     pre_mru_ = env_int("STRATA_METAL_PREFETCH_MRU", big ? 0 : 1) != 0;
     // timing only (WRONG answers): every missing expert is pointed at slot 0, nothing is read
     fake_ = env_int("STRATA_METAL_STREAM_FAKE", 0) != 0;
+    // =2 (timing only, WRONG answers): no handshakes at all - every expert not in the arena points at slot 0 once, after
+    // the fill, and the decode windows run as one plain command buffer (the GPU's own time without the 48 stops)
+    nocut_ = env_int("STRATA_METAL_STREAM_FAKE", 0) == 2;
     // STRATA_METAL_TAIL_SKIP=R (opt-in, 1..9; changes the output): in a decode window, an expert that is not in the arena
     // and that every token routes only at rank >= R (the smallest router weights of the top 10) is not read from the SSD;
     // its weight is set to zero, without renormalising the others (the CUDA serve's STRATA_ROUTE_TAIL_SKIP rule).
@@ -272,7 +275,7 @@ int ExpertStream::victim(int ci) {
             if (x.layer >= 0) {
                 const int key = x.layer * NE + x.e;
                 where_[(size_t) key] = -1;
-                smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
+                smap_.as<uint32_t>()[key] = nocut_ && !code_.empty() ? code_[0] : 0xFFFFFFFFu;
             }
             x.layer = x.e = -1;
             return s;
@@ -553,6 +556,9 @@ bool ExpertStream::make_arena(mtl::Context& cx, uint64_t budget, const std::stri
                          "profile's top (%zu ranked) in %.1f s (%.2f GB/s); %d I/O threads, read-ahead top %d; %zu buffers\n",
                  (arena_bytes_ - retired_bytes) / 1e9, (unsigned long long) (pairs - nretired), cls_.size(), done, from_profile, fill_s_,
                  fill_bytes_ / 1e9 / std::max(1e-9, fill_s_), nio_, prefetch_ ? pre_k_ : 0, chunks_.size());
+    if (nocut_)
+        for (int k = 0; k < NL * NE; ++k)
+            if (where_[(size_t) k] < 0) smap_.as<uint32_t>()[k] = code_[0];
     // Wire the filled arena (mlock).  Unwired, the arena is ordinary anonymous memory whenever the GPU is not running a command buffer
     // (the GPU's own wiring ends a few seconds after the last one; a Metal residency set did not hold it either, measured), and
     // macOS compresses it when anything else wants memory: a 20 GB file written beside the idle engine took tens of GB of the arena
@@ -836,7 +842,7 @@ void ExpertStream::hold_region(bool hold) {
             if (x.layer >= 0) {
                 const int key = x.layer * NE + x.e;
                 where_[(size_t) key] = -1;
-                smap_.as<uint32_t>()[key] = 0xFFFFFFFFu;
+                smap_.as<uint32_t>()[key] = nocut_ && !code_.empty() ? code_[0] : 0xFFFFFFFFu;
             }
             x.layer = x.e = -1;
             x.pre = false;

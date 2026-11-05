@@ -66,6 +66,7 @@ public:
     void at_layer(int l, int T, int topk, const int32_t* ids, const float* pred, const float* pred2 = nullptr,
                   int32_t* plan = nullptr);
     int ahead2() const { return pre_k2_; }
+    bool nocut() const { return nocut_; }   // STRATA_METAL_STREAM_FAKE=2: decode windows without handshakes (timing only)
     // a prompt's scratch buffers inside the arena: region() places them (once), hold_region() empties and holds its
     // slots while a prompt runs and gives them back after
     uint8_t* region(uint64_t bytes);
@@ -121,6 +122,7 @@ private:
     int outstanding_ = 0;
     int nio_ = 6, pre_k_ = 10, pre_k2_ = 0, split_ = 2;
     bool prefetch_ = true, fake_ = false, pre_mru_ = false;
+    bool nocut_ = false;
     int tail_rank_ = 0;   // STRATA_METAL_TAIL_SKIP=R (0: off): a decode miss every token routes at rank >= R is not read
     uint64_t tail_skipped_ = 0;
     int stats_every_ = 0;   // STRATA_METAL_STREAM_STATS=N: a running-totals line every N decode windows (0: off)

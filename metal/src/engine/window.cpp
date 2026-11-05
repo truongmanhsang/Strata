@@ -892,6 +892,21 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
         else if (ty == ref::Q8_0 && n_in == 640) { L = 4; Rr = 2; S = 4; K = 1; }
     }
     {
+        // STRATA_METAL_GEMV_TILES=m2 (opt-in): one-token tiles measured on an M2 Max (gemv_parity --one, us default -> m2):
+        // Q5_K head 2560 -> 248320 2017 -> 1742 (8,1,8,1); Q4_K 6144 -> 2560 68.5 -> 45.8 and Q5_K 70.1 -> 48.2 (8,1,8,1);
+        // IQ4_XS 6144 -> 2560 63.3 -> 43.1 (16,1,8,4); 2560 -> 10240 IQ4_XS 66.5 -> 52.3, Q4_K 85.7 -> 77.2, Q6_K 85.6 -> 70.6
+        // (16,2,4,1).  Only these formats and shapes; the lane sums' order changes.
+        static const bool m2_tiles = [] { const char* e = std::getenv("STRATA_METAL_GEMV_TILES"); return e && std::string(e) == "m2"; }();
+        if (m2_tiles && ntok == 1 && !gyro_dense_) {
+            if ((ty == ref::Q4_K || ty == ref::Q5_K) && n_in >= 6144) { L = 8; Rr = 1; S = 8; K = 1; }
+            else if (ty == ref::IQ4_XS && n_in >= 6144) { L = 16; Rr = 1; S = 8; K = 4; }
+            else if (ty == ref::Q5_K && n_in == 2560 && n_out >= 100000) { L = 8; Rr = 1; S = 8; K = 1; }
+            else if ((ty == ref::IQ4_XS || ty == ref::Q4_K || ty == ref::Q6_K) && n_in == 2560 && n_out >= 6144 && n_out < 100000) {
+                L = 16; Rr = 2; S = 4; K = 1;
+            }
+        }
+    }
+    {
         // windows of several tokens: NR rows a lane share each x load (the window's cost is its x traffic).  The sums
         // run in the same order for any NR, so the answers do not change.  STRATA_METAL_GEMV_NR (1, 2): the tile.
         static const int nr_env = [] { const char* e = std::getenv("STRATA_METAL_GEMV_NR"); return e ? std::atoi(e) : 1; }();
@@ -1190,12 +1205,24 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         // the trellis gate/up: 16 lanes a row, 2 rows a lane (expert_parity --bench --sweep, M4, TQK6, 10 experts: 166.6 us a layer
         // against 174.5 for 32,2,4 and 196.8 for 32,1,4; also the fastest at 2 and 3 tokens)
         const bool tq_ = tg_.type >= 144;
-        const int gl = tq_ ? 16 : 32, gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
+        int gl = tq_ ? 16 : 32, gr = tq_ ? 2 : 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
-        const int dl = dq2 || (m4 && td.type == ref::Q8_0) ? 8 : 4,
-                  dr = dq2 || (m4 && (td.type == ref::Q8_0 || td.type == ref::Q5_1)) ? 1 : 2;
+        int dl = dq2 || (m4 && td.type == ref::Q8_0) ? 8 : 4,
+            dr = dq2 || (m4 && (td.type == ref::Q8_0 || td.type == ref::Q5_1)) ? 1 : 2;
+        // STRATA_METAL_MOE_TILES=gl,gr,gs,dl,dr,ds (opt-in): the decode experts' gate/up and down tiles, one of moe.metal's
+        // GU_SET / DN_SET instantiations (expert_parity --bench --sweep picks them per chip).  M2 Max, Q2_0, 1 token:
+        // 8,1,4,4,2,4 runs a layer's experts in 88.6 us against 110.4 for the default 32,1,4,8,1,4.  The sums' order changes.
+        static const std::vector<int> moe_tiles = [] {
+            std::vector<int> v;
+            if (const char* e = std::getenv("STRATA_METAL_MOE_TILES")) {
+                std::string s = std::string(e) + ",", w;
+                for (char c : s) { if (c == ',') { if (!w.empty()) v.push_back(std::atoi(w.c_str())); w.clear(); } else w += c; }
+            }
+            return v.size() == 6 ? v : std::vector<int>();
+        }();
+        if (!moe_tiles.empty() && !tq_) { gl = moe_tiles[0]; gr = moe_tiles[1]; gs = moe_tiles[2]; dl = moe_tiles[3]; dr = moe_tiles[4]; ds_ = moe_tiles[5]; }
         const bool m16 = f16_enc_ && !stream_ && tg_.type == ref::Q2_0 && dq2 && !had_gu(l) && !had_dn(l);
         a.gx_gu = NFF / (gs * (32 / gl) * gr);
         a.gx_dn = N / (ds_ * (32 / dl) * dr);
@@ -1405,7 +1432,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         {
             static const int kt = std::getenv("STRATA_METAL_KPROF") ? std::atoi(std::getenv("STRATA_METAL_KPROF")) : 0;
             static int seen = 0;
-            if (kt == Tn && head && ++seen == 20 && !stream_) kprof(c.ds, Tn);
+            if (kt == Tn && head && ++seen == 20 && (!stream_ || st_->nocut())) kprof(c.ds, Tn);
         }
         tp_rg_ = now_ms() - r0;
         last_n_disp_ = (int) c.ds.size();
@@ -1546,6 +1573,7 @@ bool Window::finish_rows(int Tn, const int32_t* tokens, int32_t* out, double t0)
 
 double Window::run_ds(Cached& c) {
     if (!stream_) return cx_->run_graph(c.ds);
+    if (st_->nocut() && !cut_ids_) return cx_->run_graph(c.ds);   // STRATA_METAL_STREAM_FAKE=2 (timing only)
     return cx_->run_graph_seg(c.ds, c.cuts, [](void* u, int s) { ((Window*) u)->at_cut(s); }, this);
 }
 
