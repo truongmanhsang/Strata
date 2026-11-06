@@ -56,7 +56,7 @@ Q2_0, 128K, arena 10 GB, prompt chunk 4096:
 | Edit request, chunk 2048 | 1,311 | 150 | same prompt |
 | Short prompt (25–33 tokens) | 25–33 | 8–17 | first request after load, not reliable |
 
-Q2_0, 256K, lệnh `fast` (below), measured by the user on the same machine: **about 300 tok/s**, one run, prompt length not recorded.
+Q2_0, 256K, the `fast` command (below), measured by the user on the same machine: **about 300 tok/s**, one run, prompt length not recorded.
 Earlier, a 256K run with the stock setup gave 249 tok/s. Not measured: the 256K prefill with TAIL_SKIP 7, and any IQ3_XXS prefill.
 
 ### Decode (tok/s)
