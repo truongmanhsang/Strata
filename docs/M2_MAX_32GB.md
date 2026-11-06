@@ -43,7 +43,23 @@ Return to the stock engine at any time with `strata components use 0.1.56-macos-
 | `STRATA_METAL_Q3KR=1` | Q3_K matrices re-laid for faster GEMVs (bitwise same output) | GEMVs 1.4–1.8x faster, but ~0–3% in real decode: the SSD wait sets the pace |
 | `--drafting dflash2` | DFlash2 speculative drafter | code +30–35%; prose +5–10% |
 
-## Benchmark results (tok/s, decode)
+## Benchmark results
+
+### Prefill (prompt processing, tok/s)
+
+Q2_0, 128K, arena 10 GB, prompt chunk 4096:
+
+| Prompt | Tokens | Prefill tok/s | Notes |
+|---|---|---|---|
+| Document (DETAILS.md, 24K characters) | 7,347 | 266–281 | 4 runs |
+| Edit request | 1,311 | 129 | first request after load |
+| Edit request, chunk 2048 | 1,311 | 150 | same prompt |
+| Short prompt (25–33 tokens) | 25–33 | 8–17 | first request after load, not reliable |
+
+Q2_0, 256K, lệnh `fast` (below), measured by the user on the same machine: **about 300 tok/s**, one run, prompt length not recorded.
+Earlier, a 256K run with the stock setup gave 249 tok/s. Not measured: the 256K prefill with TAIL_SKIP 7, and any IQ3_XXS prefill.
+
+### Decode (tok/s)
 
 **Q2_0, 128K, arena 10 GB** (story / explanation / code):
 
