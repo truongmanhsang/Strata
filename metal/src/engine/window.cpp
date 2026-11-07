@@ -2723,7 +2723,7 @@ struct PgEpi { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PgGdnP { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
 struct PgPlan { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
 struct PgMm { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
-int pg_unit(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 ? 16 : 32; }
+int pg_unit(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32; }   // 18 IQ3_XXS, 16 IQ2_XXS, 17 IQ2_XS, 22 IQ2_S: the 16-value units (as pc_unit_of)
 // the v2 (M4) expert tiles: the K-quants need TK 128, Q8_0 / IQ4_XS TK 32 (their 32-value units), the rest TK 16
 std::string gu2_tile(int t) {
     if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return "_16_16_128_2";   // the M4's best (513fc615)

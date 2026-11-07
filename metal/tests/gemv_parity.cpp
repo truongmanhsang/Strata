@@ -66,7 +66,7 @@ mtl::Dispatch xprep_dispatch(const mtl::Pipeline& p, const mtl::Buffer& x, const
 
 int type_of(const std::string& s) {
     for (int t : {ref::Q2_0, ref::Q4_0, ref::Q5_0, ref::Q8_0, ref::Q3_K, ref::Q4_K, ref::Q5_K, ref::Q6_K, ref::IQ4_NL,
-                  ref::IQ4_XS, ref::IQ3_S, ref::BF16})
+                  ref::IQ4_XS, ref::IQ3_S, ref::IQ3_XXS, ref::IQ2_S, ref::BF16})
         if (s == ref::type_name(t)) return t;
     std::fprintf(stderr, "unknown type %s\n", s.c_str());
     std::exit(2);
@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
             const int ty = t.type;
             const bool gemv_type = ty == ref::BF16 || ty == ref::Q8_0 || ty == ref::Q4_0 || ty == ref::Q5_0 ||
                                    ty == ref::IQ4_NL || ty == ref::IQ4_XS || ty == ref::Q2_0 || ty == ref::IQ3_S ||
+                                   ty == ref::IQ3_XXS || ty == ref::IQ2_S ||
                                    ty == ref::Q3_K || ty == ref::Q4_K || ty == ref::Q5_K || ty == ref::Q6_K;
             if (gemv_type && !pick.count(ty)) pick[ty] = &t;
         }
