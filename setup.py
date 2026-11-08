@@ -6808,7 +6808,15 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
 
 
 def engine_exe(eng: Path) -> str:
-    """The `exe` of a run config: the engine component in the app, else the engine binary's path."""
+    """The `exe` of a run config: the engine component in the app, else the engine binary's path. STRATA_ENGINE_EXE names
+    the binary to run instead (a build of this source tree, e.g. build-metal/strata, which has the newest code, the speed
+    projection on Metal among it): the config then runs that file, the installed component is not used."""
+    override = os.environ.get("STRATA_ENGINE_EXE", "").strip()
+    if override:
+        path = Path(override).expanduser().resolve()
+        if not path.is_file():
+            fail(f"STRATA_ENGINE_EXE names a file that is not there: {path}")
+        return str(path)
     return "component:strata-engine" if CONTROL else str(eng / EXE)
 
 
@@ -9349,6 +9357,13 @@ def prepare_pack_only(a) -> int:
     return 0
 
 
+def esp_engine_args(esp) -> list[str]:
+    """The engine flags of the experimental speed projection (--experimental-speed-projection): the package's profile, with
+    llama.cpp's flags (the engine takes the same ones; the Metal engine runs them too, metal/src/engine/cvec.cpp)."""
+    return ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
+            "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+
+
 def mac_control_setup(a) -> int:
     """The app (and the Terminal's `strata launch`) on a Mac, STRATA_CONTROL_INSTALL=1: the same job as on Windows and Linux. It
     downloads and prepares the model files and writes a run config whose engine is "component:strata-engine"; it builds nothing
@@ -9524,6 +9539,18 @@ def mac_control_setup(a) -> int:
                                                    "gpu": vision == "gpu", "max_tokens": vision_tokens(a.vision_tokens, vision, None)})
         if vision == "cpu":
             cfg["vision"]["threads"] = vision_threads()
+    # EXPERIMENTAL: the speed projection, off unless the launch names it (the Terminal's --experimental-speed-projection, which
+    # the app passes too); Qwen3.8-Flash-Next only. The Metal engine runs the vector (metal/src/engine/cvec.cpp).
+    esp_choice = str(getattr(a, "experimental_speed_projection", None) or "off").strip()
+    if esp_choice.lower() not in ("off", "no", "n", "0"):
+        if family != "qwen":
+            warn(f"the experimental speed projection is made for Qwen3.8-Flash-Next: left off for {model}")
+        else:
+            esp = ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1") else Path(esp_choice).expanduser().resolve()
+            if not esp.is_file():
+                fail(f"the experimental speed projection's vector is missing: {esp}")
+            cfg["args"] += esp_engine_args(esp)
+            ok("experimental speed projection: ON (experimental; the answers change)")
     cfg_path = home() / f"strata-{tag.lower()}.json"
     write_setup_config(cfg_path, cfg)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -10807,9 +10834,7 @@ def main() -> int:
             if w:
                 warn(w)                                   # #1445: a warning only, never a refusal
     if esp is not None:
-        # the package's profile, with llama.cpp's flags (the engine takes the same ones)
-        args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
-                 "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+        args += esp_engine_args(esp)
     cfg = {"exe": engine_exe(eng), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(home() / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}

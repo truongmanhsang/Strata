@@ -512,8 +512,49 @@ class SetupArgs(unittest.TestCase):
     def test_a_mac_gets_only_the_options_its_setup_knows(self):
         with mock.patch.object(sys, "platform", "darwin"):
             a = self.runner(data_dir="/d", gpus=[0])
-        self.assertEqual(a, ["--yes", "--no-start", "--family", "qwen", "--model", "IQ3_XXS", "--context", "32768", "--vision", "no", "--data-dir", "/d",
-                             "--set-default-data-dir"])
+        self.assertEqual(a, ["--yes", "--no-start", "--family", "qwen", "--model", "IQ3_XXS", "--context", "32768", "--vision", "no",
+                             "--experimental-speed-projection", "off", "--data-dir", "/d", "--set-default-data-dir"])
+
+    def test_the_speed_projection_choice_reaches_setup(self):
+        # off unless chosen; on or a vector file is passed on, on a Mac too (its Metal engine runs the vector)
+        with mock.patch.object(sys, "platform", "darwin"):
+            mac_on = self.runner(data_dir="/d", esp="on")
+        self.assertEqual(mac_on[mac_on.index("--experimental-speed-projection") + 1], "on")
+        with mock.patch.object(sys, "platform", "linux"):
+            other = self.runner(esp="/x/vector.gguf")
+            default = self.runner()
+        self.assertEqual(other[other.index("--experimental-speed-projection") + 1], "/x/vector.gguf")
+        self.assertEqual(default[default.index("--experimental-speed-projection") + 1], "off")
+
+    def test_a_launch_that_names_the_speed_projection_checks_the_installed_config(self):
+        # a launch that names the projection re-runs setup when the installed config differs; one that does not keeps it
+        with Home():
+            cat = catalog(HW_12)
+            on = Runner(S.LaunchSettings(family="qwen", model="Q2_0", esp="on"), catalog=cat)
+            off = Runner(S.LaunchSettings(family="qwen", model="Q2_0", esp="off"), catalog=cat)
+            keep = Runner(S.LaunchSettings(family="qwen", model="Q2_0"), catalog=cat)
+        vector = ["--control-vector-scaled", "/x/v.gguf:1.0", "--control-vector-layer-range", "4", "44"]
+        self.assertFalse(on.esp_matches({"args": ["--pack", "p"]}))
+        self.assertTrue(on.esp_matches({"args": ["--pack", "p"] + vector}))
+        self.assertTrue(off.esp_matches({"args": ["--pack", "p"]}))
+        self.assertFalse(off.esp_matches({"args": ["--pack", "p"] + vector}))
+        self.assertTrue(keep.esp_matches({"args": ["--pack", "p"] + vector}))
+        self.assertTrue(keep.esp_matches({"args": ["--pack", "p"]}))
+
+    def test_the_engine_override_names_a_binary_of_this_source(self):
+        import tempfile
+        from strata_cli.launch.runner import engine_override
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "strata"
+            exe.write_text("engine", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STRATA_ENGINE_EXE": str(exe)}):
+                self.assertEqual(engine_override(), str(exe.resolve()))
+            with mock.patch.dict(os.environ, {"STRATA_ENGINE_EXE": str(Path(d) / "missing")}):
+                with self.assertRaises(Exception) as caught:
+                    engine_override()
+                self.assertIn("not there", str(caught.exception))
+            with mock.patch.dict(os.environ, {"STRATA_ENGINE_EXE": ""}):
+                self.assertIsNone(engine_override())
 
 
 class AdoptRules(unittest.TestCase):

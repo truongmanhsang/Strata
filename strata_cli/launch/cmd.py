@@ -101,6 +101,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--mtp", type=_choice("a draft layer setting", S.MTP_MODES), metavar="on|off",
                    help="the draft layer that makes answers faster. off starts without it: about 1 GB less graphics memory and less RAM, "
                         "slower answers; use it when the engine stops at start on a small card or a PC with little RAM. Default: on")
+    g.add_argument("--experimental-speed-projection", dest="esp", metavar="on|off|GGUF",
+                   help="EXPERIMENTAL: a control vector for Qwen3.8-Flash-Next that changes how it answers (it declines far fewer requests). "
+                        "off by default; on uses data/experimental-speed-projection; a path uses another vector file. Works on the Mac (Metal) too")
     g.add_argument("--drafting", type=_choice("a drafting setting", S.DRAFTING_MODES), metavar="auto|mtp|dflash2|off",
                    help="which drafter guesses words ahead to make answers faster, one at a time: auto (recommended: DFlash2 for Qwen3.8-Flash-Next where the engine has it, "
                         "else the MTP), mtp, dflash2 (downloads a 1.2 GB drafter once) or off. If DFlash2 cannot run (several requests at once, "
@@ -246,6 +249,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.parallel = a.parallel
     if a.mtp:
         s.mtp = a.mtp
+    if getattr(a, "esp", None):
+        s.esp = a.esp
     if a.drafting:
         s.drafting = a.drafting
     if getattr(a, "split_engine", None):
@@ -940,6 +945,8 @@ def run_launch(a: argparse.Namespace) -> int:
                     _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")
                 if plan.get("speed"):
                     _say(f"  speed     {plan['speed'].replace('Speed: ', '', 1)}")
+                if s.esp and s.family in ("qwen", "coder") and str(s.esp).lower() not in ("off", "no", "n", "0"):
+                    _say("  projection  experimental speed projection on (the answers change; off per request in the web app or the API)")
                 _placement_lines(plan.get("placement"))
                 _parallel_lines(plan.get("parallel"))
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"

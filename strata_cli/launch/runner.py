@@ -530,6 +530,22 @@ def own_log_path(base: dict) -> str | None:
     return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
 
 
+ENGINE_OVERRIDE_ENV = "STRATA_ENGINE_EXE"
+
+
+def engine_override() -> str | None:
+    """A developer's engine binary, named by STRATA_ENGINE_EXE (e.g. build-metal/strata of this source tree, which has the newest code): the
+    run configs run that file instead of the installed component. None when the variable is not set."""
+    value = os.environ.get(ENGINE_OVERRIDE_ENV, "").strip()
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise LaunchError(f"{ENGINE_OVERRIDE_ENV} names a file that is not there: {path}",
+                          "Build the engine first (build-strata-metal.sh), or unset the variable to use the installed engine.", 2)
+    return str(path)
+
+
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
                   experts: int | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced)."""
@@ -548,7 +564,11 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["drafting"] = chosen
     if s.split_engine:                                       # strata_control/split_engine.py: read by apply_split_engine; "off" survives every update
         cfg["split_engine"] = s.split_engine
-    cfg.setdefault("exe", "component:strata-engine")
+    override = engine_override()
+    if override:
+        cfg["exe"] = override                                # STRATA_ENGINE_EXE: the developer's build runs, whatever the installed config names
+    else:
+        cfg.setdefault("exe", "component:strata-engine")
     cfg["open_browser"] = False                              # strata launch never opens a browser by itself (only `--open` does, after the start)
     if isinstance(cfg.get("args"), list):
         cfg["args"] = [a for a in cfg["args"] if a != "--open"]
@@ -947,8 +967,8 @@ class Runner:
         args += ["--vision", self.vision_word()]
         if s.kv:
             args += ["--kv", s.kv]
-        if fam in ("qwen", "coder"):
-            args += ["--experimental-speed-projection", "off"]
+        if fam in ("qwen", "coder"):                  # off unless the person chose it (--experimental-speed-projection on, or a vector file)
+            args += ["--experimental-speed-projection", str(s.esp or "off")]
         resolved = self.resolved_drafting(fam)
         mtp_word = s.mtp if resolved != "off" else "off"
         if mtp_word in ("on", "off") and fam in modelstate.HELPER_FAMILIES:
@@ -976,9 +996,10 @@ class Runner:
         else:
             args += self.installed_card_args()
         if sys.platform == "darwin":
-            # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
+            # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu); the speed projection
+            # is kept: the Metal engine runs the vector (metal/src/engine/cvec.cpp)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed", "--dsv41-package"}   # (the last two: the DeepSeek engine package, 0.2.7.1)
+                    "--set-default-data-dir", "--feed", "--dsv41-package", "--experimental-speed-projection"}   # (--feed and --dsv41-package: the DeepSeek engine package, 0.2.7.1)
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
             while i < len(args):
@@ -1155,6 +1176,22 @@ class Runner:
             pass
         return job
 
+    def esp_matches(self, cfg: dict) -> bool:
+        """Whether the installed run config runs the speed projection the way this launch asks (--experimental-speed-projection). A
+        launch that does not name it keeps what is installed; one that names it re-runs setup when the installed config differs."""
+        choice = self.s.esp
+        if choice is None:
+            return True
+        args = [str(a) for a in cfg.get("args") or []]
+        installed = "--control-vector-scaled" in args
+        wanted = str(choice).strip().lower() not in ("off", "no", "n", "0")
+        if installed != wanted:
+            return False
+        if wanted and str(choice).strip().lower() not in ("on", "yes", "y", "1"):
+            i = args.index("--control-vector-scaled")
+            return i + 1 < len(args) and args[i + 1].rsplit(":", 1)[0] == str(Path(str(choice)).expanduser().resolve())
+        return True
+
     def ensure_model(self) -> Path:
         s, cat = self.s, self.catalog
         self.check_own_files()
@@ -1163,7 +1200,7 @@ class Runner:
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
         if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) \
-                and not self.dsv41_engine_missing(read_config(path)):
+                and not self.dsv41_engine_missing(read_config(path)) and self.esp_matches(read_config(path)):
             if self.installed_serves_request(path):
                 self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
                 return path
