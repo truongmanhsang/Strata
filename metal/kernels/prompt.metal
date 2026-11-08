@@ -148,6 +148,55 @@ kernel void gr_norm_h(device float* R [[buffer(0)]], device const float* bo [[bu
     for (uint d = tid; d < n; d += 256) o[d] = half(r[d] * w[d] * rs);
 }
 
+// gr_norm_h with the control vector (gr.metal's gr_norm_cv): the steered residual is written back, xn as fp16.
+kernel void gr_norm_h_cv(device float* R [[buffer(0)]], device const float* bo [[buffer(1)]],
+                         device const float* inj [[buffer(2)]], device const float* w_norm [[buffer(3)]],
+                         device half* xnh [[buffer(4)]], constant GrArgs& a [[buffer(5)]],
+                         constant CvArgs& cv [[buffer(6)]], device const uint* on [[buffer(7)]],
+                         device const float* dir [[buffer(8)]],
+                         uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                         ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    threadgroup float dpart[8];
+    const uint c = tg.x, t = tg.y, n = a.n_embd;
+    device float* r = R + (t * a.hc + c) * n;
+    const float g = a.apply ? 2.0f / (1.0f + exp(-inj[t * a.hc + c] / float(a.hc))) : 0.0f;
+    float ss = 0.0f;
+    for (uint d = tid; d < n; d += 256) {
+        float v = r[d];
+        if (a.apply) {
+            v = fma(bo[t * n + d], g, v);
+            r[d] = v;
+        }
+        ss = fma(v, v, ss);
+    }
+    if (on[0] != 0u) {   // one value for the whole group, so every thread reaches the barriers below
+        float dp = 0.0f;
+        for (uint d = tid; d < n; d += 256) dp = fma(r[d], dir[d], dp);
+        dp = simd_sum(dp);
+        if (lane == 0) dpart[sg] = dp;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float dot = 0.0f;
+        for (int i = 0; i < 8; ++i) dot += dpart[i];
+        ss = 0.0f;
+        for (uint d = tid; d < n; d += 256) {
+            const float v = r[d], u = dir[d];
+            const float w2 = cv.mode == 0 ? fma(-cv.s * dot, u, v) : fma(cv.s, u, v);
+            r[d] = w2;
+            ss = fma(w2, w2, ss);
+        }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 8; ++i) tot += part[i];
+    const float rs = rsqrt(tot / float(n) + a.eps);
+    device half* o = xnh + (t * a.hc + c) * n;
+    device const float* w = w_norm + c * n;
+    for (uint d = tid; d < n; d += 256) o[d] = half(r[d] * w[d] * rs);
+}
+
 // gemm_hc_up: G = lo . w_up^T with w_up's rows interleaved by dq_f16 (perm = hc: row d * hc + c), so a TN-column
 // tile holds TN / hc outputs d with all their streams; the epilogue mixed[t][d] = mean_c xn[t][c][d] *
 // sigmoid(G[t][d * hc + c]) -> fp32 and fp16.  G is never written.  grid (hc * n / TN, ceil(T / TM)), 32 * SG threads.

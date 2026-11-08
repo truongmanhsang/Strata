@@ -93,6 +93,60 @@ kernel void gr_norm2(device float* R [[buffer(0)]], device const float* bo [[buf
     for (int j = 0; j < NJ; ++j) o[tid + 256 * j] = rv[j] * wv[j] * rs;
 }
 
+// ---- the control vector (--control-vector-scaled; the experimental speed projection) in the read ------------------------
+// gr_norm with the vector of the layer that made the pending write (llama.cpp's build_cvec after that layer's FFN write):
+// after the write, each stream is steered when `on` is set - project: h <- h - s (h . v) v (v unit), add: h <- h + s v -
+// and the norm and xn come from the steered residual, which is written back.  With `on` clear the arithmetic is gr_norm's,
+// so the result is bit-identical to gr_norm.  One threadgroup per (stream c, token t), as gr_norm.
+struct CvArgs { float s; uint mode; };   // mode 0 = project, 1 = add
+kernel void gr_norm_cv(device float* R [[buffer(0)]], device const float* bo [[buffer(1)]],
+                       device const float* inj [[buffer(2)]], device const float* w_norm [[buffer(3)]],
+                       device float* xn [[buffer(4)]], constant GrArgs& a [[buffer(5)]],
+                       constant CvArgs& cv [[buffer(6)]], device const uint* on [[buffer(7)]],
+                       device const float* dir [[buffer(8)]],
+                       uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                       ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    threadgroup float dpart[8];
+    const uint c = tg.x, t = tg.y, n = a.n_embd;
+    device float* r = R + (t * a.hc + c) * n;
+    const float g = a.apply ? 2.0f / (1.0f + exp(-inj[t * a.hc + c] / float(a.hc))) : 0.0f;
+    float ss = 0.0f;
+    for (uint d = tid; d < n; d += 256) {
+        float v = r[d];
+        if (a.apply) {
+            v = fma(bo[t * n + d], g, v);
+            r[d] = v;
+        }
+        ss = fma(v, v, ss);
+    }
+    if (on[0] != 0u) {   // one value for the whole group, so every thread reaches the barriers below
+        float dp = 0.0f;
+        for (uint d = tid; d < n; d += 256) dp = fma(r[d], dir[d], dp);
+        dp = simd_sum(dp);
+        if (lane == 0) dpart[sg] = dp;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float dot = 0.0f;
+        for (int i = 0; i < 8; ++i) dot += dpart[i];
+        ss = 0.0f;
+        for (uint d = tid; d < n; d += 256) {
+            const float v = r[d], u = dir[d];
+            const float w2 = cv.mode == 0 ? fma(-cv.s * dot, u, v) : fma(cv.s, u, v);
+            r[d] = w2;
+            ss = fma(w2, w2, ss);
+        }
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 8; ++i) tot += part[i];
+    const float rs = rsqrt(tot / float(n) + a.eps);
+    device float* o = xn + (t * a.hc + c) * n;
+    device const float* w = w_norm + c * n;
+    for (uint d = tid; d < n; d += 256) o[d] = r[d] * w[d] * rs;
+}
+
 // rows: 0 .. hc_lr - 1 = w_down, hc_lr .. hc_lr + hc - 1 = w_inject (both bf16 rows of hc * n_embd).
 // SG simdgroups split the row's units KS ways; LPR = 32 (a simdgroup per row); RS = SG / KS rows per threadgroup.
 // one row's K-split partial over xn (units of format F)

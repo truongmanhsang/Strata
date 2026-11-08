@@ -118,6 +118,8 @@ bool Window::pc_setup(int C) {
 
 // one chunk of nT rows at cells pos0.. (the window state is exactly at pos0 before, at pos0 + nT after)
 bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& err) {
+    cv_alloc();
+    cv_flag();
     PromptBufs& b = pb_;
     strata::core::SessionState& ss = *ss_;
     const double th0 = now_ms();
@@ -180,7 +182,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         D(P_(b.lib, "act_f16"), {mtl::Arg::B(x), mtl::Arg::B(xh), mtl::Arg::V(nn)}, (nn + 255) / 256, 1, 256);
     };
     int cur_inj = 0;
-    auto hc_read = [&](const std::string& pre, bool apply) {
+    auto hc_read = [&](const std::string& pre, bool apply, int cv_layer) {
         const gguf::Tensor &tn = T(pre + "_norm.weight"), &tdn = T(pre + "_down.weight"), &tin = T(pre + "_inject.weight"),
                            &tup = T(pre + "_up.weight");
         dq(tdn, b.WD);
@@ -188,8 +190,15 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         GrArgs a{N, HC, LR, (uint32_t) nT, apply ? 1u : 0u, eps_};
         PcEpiArgs ea{(uint32_t) nT, N, HC, LR};
         dq(tup, b.WU, 0, HC);
-        D(P_(b.lib, "gr_norm_h"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]), mtl::Arg::B(W_, tn.offset),
-                                  mtl::Arg::B(b.xnh), mtl::Arg::V(a)}, HC, nT, 256);
+        if (cv_layer >= 0 && strata::kernels::cvec().covers(cv_layer)) {   // the layer's vector acts on the write first (gr_norm_h_cv)
+            const CvArgs cva{strata::kernels::cvec().s[cv_layer], (uint32_t) strata::kernels::cvec().mode};
+            D(P_(b.lib, "gr_norm_h_cv"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]), mtl::Arg::B(W_, tn.offset),
+                                          mtl::Arg::B(b.xnh), mtl::Arg::V(a), mtl::Arg::V(cva), mtl::Arg::B(cv_on_),
+                                          mtl::Arg::B(cv_dir_, (size_t) cv_layer * N * sizeof(float))}, HC, nT, 256);
+        } else {
+            D(P_(b.lib, "gr_norm_h"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]), mtl::Arg::B(W_, tn.offset),
+                                      mtl::Arg::B(b.xnh), mtl::Arg::V(a)}, HC, nT, 256);
+        }
         gemm(b.xnh, b.WD, b.V, nT, LR + HC, HC * N);
         D(P_(b.lib, "gr_epi_down"), {mtl::Arg::B(b.V), mtl::Arg::B(b.loh), mtl::Arg::B(b.inj[1 - cur_inj]), mtl::Arg::V(ea)},
           (nT * (LR + HC) + 255) / 256, 1, 256);
@@ -203,7 +212,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     int gi = 0, qi = 0;
     for (int l = 0; l < 48; ++l) {
         const std::string bl = "blk." + std::to_string(l) + ".";
-        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_), l > 0 ? l - 1 : -1);
         if (l % 4 != 3) {
             dq(T(bl + "ssm_out.weight"), b.Wout);
             PcGdnPArgs ga{(uint32_t) nT, 16, 48, 10240, eps_, 0};
@@ -302,7 +311,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             ++qi;
         }
         // ---- MoE
-        hc_read(bl + "hc_ffn", true);
+        hc_read(bl + "hc_ffn", true, -1);
         const gguf::Tensor &eg = T(bl + "ffn_gate_exps.weight"), &eu = T(bl + "ffn_up_exps.weight"), &ed = T(bl + "ffn_down_exps.weight");
         dq(T(bl + "ffn_gate_inp.weight"), b.Wr);
         dq(T(bl + "ffn_gate_inp_shexp.weight"), b.Wsg);
@@ -404,8 +413,15 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     // every row's final residual (the last write applied): the drafter's prompt rows
     {
         GrArgs a{N, HC, LR, (uint32_t) nT, 1u, eps_};
-        D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
-                                mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
+        if (strata::kernels::cvec().covers(47)) {   // layer 47's vector acts on its write, as in the decode read (gr_read's output_hc)
+            const CvArgs cva{strata::kernels::cvec().s[47], (uint32_t) strata::kernels::cvec().mode};
+            D(P_(b.lib, "gr_norm_cv"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
+                                       mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a),
+                                       mtl::Arg::V(cva), mtl::Arg::B(cv_on_), mtl::Arg::B(cv_dir_, (size_t) 47 * N * sizeof(float))}, HC, nT, 256);
+        } else {
+            D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
+                                    mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
+        }
     }
     const double g = cx_->run(ds);
     b.gpu_ms += 1000.0 * g;

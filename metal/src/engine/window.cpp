@@ -27,6 +27,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/cvec.hpp"
 namespace strata::gpu { void* host_view(const void* device_pointer); }
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -101,6 +102,7 @@ constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
 struct GrArgs { uint32_t n_embd, hc, hc_lr, n_tok, apply; float eps; };
+struct CvArgs { float s; uint32_t mode; };   // gr.metal's CvArgs: the layer's scale and mode (0 project, 1 add)
 struct MoeArgs {
     uint64_t gate_off, up_off, down_off, gu_stride, d_stride;
     uint32_t gu_row, d_row, n_embd, n_ff, n_tok, topk, n_expert, gx_gu, gx_dn, pad;
@@ -299,7 +301,11 @@ private:
     void gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const Act& x, const mtl::Buffer& y, size_t y_stride,
               int ntok, size_t y_off = 0, const mtl::Buffer* wb = nullptr);
     void xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n);
-    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok);
+    // cv_layer: the layer whose control vector acts on the write this read applies (-1: none)
+    void gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_, int ntok,
+                 int cv_layer = -1);
+    void cv_alloc();   // the control vector's device tables, once a vector is loaded
+    void cv_flag();    // the request's switch (cvec_enabled), written before each run
     void layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0);
     void ple_cpu(int T);
     // the MTP layer: the input branches + attention HC read + K/V append for `n` rows (srcR rows, host tokens) at
@@ -379,6 +385,8 @@ private:
     int64_t max_cells_ = 0;
     int64_t n_vocab_ = 0;
     float eps_ = 1e-6f;
+    mtl::Buffer cv_dir_, cv_on_;   // the control vector: directions (layers x n_embd) and the request's switch (a uint)
+    bool cv_ready_ = false;
     // buffers
     mtl::Buffer R_, bo_, inj_[2], xn_, lo_, qkv_, z_, al_, be_, yg_, logits_, ids_, wts_, plan_, h_, ye_, gsh_, ush_,
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
@@ -972,18 +980,41 @@ void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const A
     push(ds, d);
 }
 
-// the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`
+// The control vector on the device.  cv_alloc: the directions (every layer's row; a layer's scale and mode travel in its
+// CvArgs), once, when a vector is loaded.  cv_flag: the request's switch, written before each run (the GPU reads it, so a
+// request turns the vector on or off without a new graph).
+void Window::cv_alloc() {
+    if (cv_ready_ || !strata::kernels::cvec().loaded()) return;
+    const size_t L = strata::kernels::cvec().steered.size(), n = (size_t) strata::kernels::cvec().n_embd;
+    cv_dir_ = cx_->alloc(L * n * sizeof(float));
+    std::memcpy(cv_dir_.as<float>(), strata::kernels::cvec().dir, L * n * sizeof(float));
+    cv_on_ = cx_->alloc(sizeof(uint32_t));
+    cv_ready_ = true;
+}
+void Window::cv_flag() {
+    if (cv_ready_) *cv_on_.as<uint32_t>() = strata::kernels::cvec_enabled() ? 1u : 0u;
+}
+
+// the hyper-connection read (gr.metal, 3 dispatches): the previous sublayer's write folded in when `apply`; with `cv_layer`
+// steered, that layer's vector acts on the residual after the write (gr_norm_cv)
 void Window::gr_read(std::vector<mtl::Dispatch>& ds, const std::string& pre, bool apply, const Act& out, bool final_,
-                     int ntok) {
+                     int ntok, int cv_layer) {
     const gguf::Tensor& tn = T(pre + "_norm.weight");
     const gguf::Tensor& tdn = T(pre + "_down.weight");
     const gguf::Tensor& tup = T(pre + "_up.weight");
     const gguf::Tensor& tin = final_ ? tdn : T(pre + "_inject.weight");
     GrArgs a{N, HC, LR, (uint32_t) ntok, apply ? 1u : 0u, eps_};
     mtl::Dispatch d1;
-    d1.p = P(lib_, k_norm(), {}, k_norm());
-    d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
-               mtl::Arg::V(a)};
+    if (cv_layer >= 0 && strata::kernels::cvec().covers(cv_layer)) {
+        const CvArgs cva{strata::kernels::cvec().s[cv_layer], (uint32_t) strata::kernels::cvec().mode};
+        d1.p = P(lib_, "gr_norm_cv", {}, "gr_norm_cv");
+        d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
+                   mtl::Arg::V(a), mtl::Arg::V(cva), mtl::Arg::B(cv_on_), mtl::Arg::B(cv_dir_, (size_t) cv_layer * N * sizeof(float))};
+    } else {
+        d1.p = P(lib_, k_norm(), {}, k_norm());
+        d1.args = {mtl::Arg::B(R_), mtl::Arg::B(bo_), mtl::Arg::B(inj_[cur_inj_]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(xn_),
+                   mtl::Arg::V(a)};
+    }
     d1.grid[0] = HC;
     d1.grid[1] = ntok;
     d1.tg[0] = 256;
@@ -1052,7 +1083,7 @@ void Window::had_rows_ind(std::vector<mtl::Dispatch>& ds, int lib, const std::st
 void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0) {
     const std::string b = "blk." + std::to_string(l) + ".";
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it)
-    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok);
+    gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_), XA_, false, ntok, l > 0 ? l - 1 : -1);
     if (l % 4 != 3) {
         const int gi = l - l / 4;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1401,6 +1432,8 @@ void Window::ple_cpu(int Tn) {
 
 bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
     mtp_src_ = nullptr;
+    cv_alloc();
+    cv_flag();
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
     const double t0 = now_ms();
@@ -1525,7 +1558,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
     }
     for (int l = 1; l < 48; ++l) layer(ds, l, Tn, pos0);
     // ---- the final mixer and the head
-    gr_read(ds, "output_hc", true, XA_, true, Tn);
+    gr_read(ds, "output_hc", true, XA_, true, Tn, 47);   // layer 47's vector (when loaded) acts on its write
     if (head) gemv(ds, T("output.weight"), XA_, lm_, (size_t) n_vocab_, Tn);
     if (head) {
         ArgArgs a{(uint32_t) n_vocab_, 120};
@@ -2850,6 +2883,8 @@ bool Window::prompt_gemm_init(std::string& err) {
 }
 
 bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err) {
+    cv_alloc();
+    cv_flag();
     PromptGemm& p = *pg_;
     p.meta.as<uint32_t>()[2] = p.gu_v3 ? NFF / (32 * 4) : NFF / 64;
     p.meta.as<uint32_t>()[5] = p.dn_v3 ? N / (64 * 2) : N / 64;
@@ -2928,7 +2963,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         D(PP(p.lib, "act_f16"), {mtl::Arg::B(x), mtl::Arg::B(xh), mtl::Arg::V(nn)}, (nn + 255) / 256, 1, 256);
     };
     int ci = 0;
-    auto hc_read = [&](const std::string& pre, bool apply) {
+    auto hc_read = [&](const std::string& pre, bool apply, int cv_layer) {
         const gguf::Tensor &tn = TN(pre + "_norm.weight"), &tdn = TN(pre + "_down.weight"), &tin = TN(pre + "_inject.weight"),
                            &tup = TN(pre + "_up.weight");
         dq(tdn, p.WD);
@@ -2936,8 +2971,15 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         dq(tup, p.WU, 0, HC);
         GrArgs a{N, HC, LR, (uint32_t) T, apply ? 1u : 0u, eps_};
         PgEpi ea{(uint32_t) T, N, HC, LR};
-        D(PP(p.lib, "gr_norm_h"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
-                                   mtl::Arg::B(p.xnh), mtl::Arg::V(a)}, HC, T, 256);
+        if (cv_layer >= 0 && strata::kernels::cvec().covers(cv_layer)) {   // the layer's vector acts on the write first (gr_norm_h_cv)
+            const CvArgs cva{strata::kernels::cvec().s[cv_layer], (uint32_t) strata::kernels::cvec().mode};
+            D(PP(p.lib, "gr_norm_h_cv"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
+                                          mtl::Arg::B(p.xnh), mtl::Arg::V(a), mtl::Arg::V(cva), mtl::Arg::B(cv_on_),
+                                          mtl::Arg::B(cv_dir_, (size_t) cv_layer * N * sizeof(float))}, HC, T, 256);
+        } else {
+            D(PP(p.lib, "gr_norm_h"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
+                                       mtl::Arg::B(p.xnh), mtl::Arg::V(a)}, HC, T, 256);
+        }
         gemm(p.xnh, p.WD, p.V, T, LR + HC, HC * N);
         D(PP(p.lib, "gr_epi_down"), {mtl::Arg::B(p.V), mtl::Arg::B(p.loh), mtl::Arg::B(p.inj[1 - ci]), mtl::Arg::V(ea)},
           (T * (LR + HC) + 255) / 256, 1, 256);
@@ -2958,7 +3000,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     (void) MB;
     for (int l = 0; l < 48; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
-        hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_), l > 0 ? l - 1 : -1);
         if (l % 4 != 3) {
             const int gi = l - l / 4;
             dq(TN(b + "attn_qkv.weight"), p.Wqkv);
@@ -3035,7 +3077,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             // layer 0's attention write applied to R happens in the FFN read below; the PLE block comes after the FFN
         }
         // ---- the MoE
-        hc_read(b + "hc_ffn", true);
+        hc_read(b + "hc_ffn", true, -1);
         const gguf::Tensor &tr = TN(b + "ffn_gate_inp.weight"), &tsg = TN(b + "ffn_gate_inp_shexp.weight"),
                            &tg_ = TN(b + "ffn_gate_shexp.weight"), &tu_ = TN(b + "ffn_up_shexp.weight"),
                            &td_ = TN(b + "ffn_down_shexp.weight"), &eg = TN(b + "ffn_gate_exps.weight"),
@@ -3160,8 +3202,15 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     {
         const gguf::Tensor& tn = TN("output_hc_norm.weight");
         GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
-        D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
-                                              mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
+        if (strata::kernels::cvec().covers(47)) {   // layer 47's vector acts on its write, as in the decode read (gr_read's output_hc)
+            const CvArgs cva{strata::kernels::cvec().s[47], (uint32_t) strata::kernels::cvec().mode};
+            D(P(lib_, "gr_norm_cv", {}, "gr_norm_cv"),
+              {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset), mtl::Arg::B(p.YE),
+               mtl::Arg::V(a), mtl::Arg::V(cva), mtl::Arg::B(cv_on_), mtl::Arg::B(cv_dir_, (size_t) 47 * N * sizeof(float))}, HC, T, 256);
+        } else {
+            D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
+                                                  mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
+        }
     }
     const double t0 = now_ms();
     if (stream_) {
