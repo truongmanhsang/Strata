@@ -12,7 +12,8 @@ safety behaviour - you are responsible for what the model writes with it on. It 
 slightly on ordinary text (measured here: `bench/results/2026-09-27-esp/`). It is not an optimization in the engine:
 on the same text it costs 0.2-0.4% per token; a chat's speed with it on depends on the text the model writes.
 
-**Turning it on.** `START-HERE.bat --setup` asks (default: off), or pass `--experimental-speed-projection on`. With it
+**Turning it on.** `START-HERE.bat --setup` asks (default: off), or pass `--experimental-speed-projection on`. In the Terminal,
+`strata launch --experimental-speed-projection on` does the same, on a Mac too (its Metal engine runs the vector). With it
 loaded, the web app's Sampling drawer and the API field `"experimental_speed_projection": false` switch it off per
 request. See `docs/DETAILS.md`, "Experimental speed projection".
 

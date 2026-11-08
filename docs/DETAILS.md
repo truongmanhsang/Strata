@@ -1258,7 +1258,9 @@ shifts ordinary answers a little and costs 0.2-0.4% per token. What a chat's tok
 your own prompts. The Monitor marks every request ESP or stock.
 
 **Turning it on.** In a source checkout, `START-HERE.bat --setup` asks "Turn on the experimental speed projection?" (default no), or pass
-`--experimental-speed-projection on` (`off`, or a path to another vector GGUF). It writes these engine flags into `strata-<model>.json`:
+`--experimental-speed-projection on` (`off`, or a path to another vector GGUF). In the Terminal, on Windows, Linux or a Mac:
+`strata launch --model <model> --experimental-speed-projection on` (Qwen3.8-Flash-Next only; a Mac's Metal engine runs the vector too).
+Setup writes these engine flags into `strata-<model>.json`:
 
 ```
 --control-vector-scaled <Strata>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0

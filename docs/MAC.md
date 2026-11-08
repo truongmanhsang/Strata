@@ -148,6 +148,26 @@ Gyro-M runs on the same kernels (checked tensor by tensor) but no Mac tested her
 checks the decoder against the format definition and the expert kernels against a double-precision reference.
 `STRATA_METAL_GYRO_TILES=0` turns off the dense-weight tiles.
 
+### The experimental speed projection
+
+An optional control vector for Qwen3.8-Flash-Next that changes how the model answers: its package calls it a refusal-direction
+projection, so the model declines far fewer requests. It is off by default. On a Mac it runs on the Metal engine:
+
+    strata launch --model q2_0 --experimental-speed-projection on
+
+The vector runs only on an engine that has the Metal port. The engine that comes with the app does not have it yet, so while
+building from this source tree, name the build's binary for the launch (the run config keeps it, so `strata launch --preset NAME`
+starts it again):
+
+    STRATA_ENGINE_EXE=$PWD/build-metal/strata strata launch --model q2_0 --experimental-speed-projection on
+
+`on` passes the vector to the model setup, which writes its engine flags into the run config. `off` turns it off again, and a path
+uses another vector file. Once it is loaded, the web app's Sampling drawer and the API's `"experimental_speed_projection": false`
+switch it off for a request; with it off, the answers are the stock model's. The quality cost on Q2_0 is measured in
+[DETAILS.md](DETAILS.md#experimental-speed-projection): the top-1 token changes at 10% of positions. Decode on Q2_0 on this Mac
+(M2 Max, 32 GB, 3 to 4 requests each): stock 17.5 tok/s in one server start; with the vector loaded in another, 17.2 switched off
+and 16.5 on.
+
 ## Measured (M5 Max, 128 GB)
 
 **Measured on:** Apple M5 Max, 128 GB, macOS 27.2, Qwen3.8-Flash-Next packs, greedy, 200 generated tokens, Strata engine version
@@ -209,6 +229,8 @@ from each other: top-1 agreement 95.4% against 95.8%, mean KL 0.0207 against 0.0
 
 ## Limits (this version)
 
+- **Speed projection and drafting:** with the vector on, the DFlash2 drafter still reads the residual before the vector is applied. Its
+  effect on speed was not measured.
 - **Images (vision):** on by default. The app and the Terminal use the `strata-vision` that sits beside `strata` in the engine
   package; `./setup.sh` builds it and asks "Should the model also read images?" (default yes). With `--gpu` it reads on the Mac's
   GPU (ggml's Metal backend), without it on the CPU. A Mac always gets the GPU reader, whatever its memory. The footprint is about
